@@ -28,5 +28,10 @@
     "ap-southeast-2a",
     "ap-southeast-2b",
     "ap-southeast-2c"
+  ],
+  "availability-zones:account=828936781852:region=ap-northeast-1": [
+    "ap-northeast-1a",
+    "ap-northeast-1c",
+    "ap-northeast-1d"
   ]
 }
