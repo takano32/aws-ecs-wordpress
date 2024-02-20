@@ -95,7 +95,7 @@ export class AwsEcsWordpressStack extends cdk.Stack {
     });
 
     let clusterEngine = rds.DatabaseClusterEngine.auroraMysql({
-      version: rds.AuroraMysqlEngineVersion.VER_3_03_0
+      version: rds.AuroraMysqlEngineVersion.VER_3_04_1
     });
 
     // create the aurora mysql database
