@@ -213,8 +213,8 @@ export class AwsEcsWordpressStack extends cdk.Stack {
     wordpress.service.connections.addSecurityGroup(taskSecurityGroup);
 
     wordpress.service.autoScaleTaskCount({
-      minCapacity: 1,
-      maxCapacity: 10,
+      minCapacity: 3,
+      maxCapacity: 12,
     });
 
     wordpress.targetGroup.configureHealthCheck({
