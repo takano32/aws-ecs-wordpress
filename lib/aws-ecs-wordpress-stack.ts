@@ -7,6 +7,7 @@ import * as efs from 'aws-cdk-lib/aws-efs';
 import * as rds from 'aws-cdk-lib/aws-rds';
 import * as secretsManager from 'aws-cdk-lib/aws-secretsmanager'
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as alb from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 
 export class AwsEcsWordpressStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -14,10 +15,10 @@ export class AwsEcsWordpressStack extends cdk.Stack {
 
     // create the vpc
     const vpc = new ec2.Vpc(this, 'VPC');
-    
+
     // create the ecs cluster
     const cluster = new ecs.Cluster(this, 'Cluster', {
-      vpc,
+      vpc: vpc,
     });
 
     // create wordpress secrets
@@ -106,22 +107,31 @@ export class AwsEcsWordpressStack extends cdk.Stack {
         username: 'admin',
         password: cdk.SecretValue.secretsManager(secretDatabaseCredentials.secretArn)
       },
-      instanceProps: {
-        vpc,
-        instanceType: ec2.InstanceType.of(ec2.InstanceClass.BURSTABLE3, ec2.InstanceSize.MEDIUM),
-      },
-      removalPolicy: cdk.RemovalPolicy.DESTROY
+      vpc: vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      instanceUpdateBehaviour: rds.InstanceUpdateBehaviour.ROLLING,
+      writer: rds.ClusterInstance.provisioned("WriterInstance", {
+        instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
+        enablePerformanceInsights: false,
+      }),
+      readers: [
+        rds.ClusterInstance.provisioned("ReaderInstance", {
+          instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
+          enablePerformanceInsights: false,
+        }),
+      ],
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
     // create the shared file system
     const fsSecurityGroup = new ec2.SecurityGroup(this, 'EfsSecurityGroup', {
-      vpc,
+      vpc: vpc,
       description: 'allow access to the efs file system',
       allowAllOutbound: true
     });
 
     const fileSystem = new efs.FileSystem(this, 'Content', {
-      vpc,
+      vpc: vpc,
       encrypted: true,
       securityGroup: fsSecurityGroup,
       performanceMode: efs.PerformanceMode.GENERAL_PURPOSE,
@@ -134,7 +144,8 @@ export class AwsEcsWordpressStack extends cdk.Stack {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
     });
 
-    taskExecutionRole.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy'))
+    taskExecutionRole.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName(
+      'service-role/AmazonECSTaskExecutionRolePolicy'));
     secretDatabaseCredentials.grantRead(taskExecutionRole);
     secretAuthKey.grantRead(taskExecutionRole);
     secretSecureAuthKey.grantRead(taskExecutionRole);
@@ -146,12 +157,12 @@ export class AwsEcsWordpressStack extends cdk.Stack {
     secretNonceSalt.grantRead(taskExecutionRole);
 
     const taskSecurityGroup = new ec2.SecurityGroup(this, 'TaskSecurityGroup', {
-      vpc,
+      vpc: vpc,
       description: 'allow access to the task',
       allowAllOutbound: true
     });
 
-    const taskDef = new ecs.FargateTaskDefinition(this, 'TaskDef', {
+    const taskDef = new ecs.FargateTaskDefinition(this, 'TaskDefinition', {
       family: 'wordpress',
       executionRole: taskExecutionRole,
       memoryLimitMiB: 1024,
@@ -164,14 +175,14 @@ export class AwsEcsWordpressStack extends cdk.Stack {
     cfnTask.addPropertyOverride('Volumes', [{
       Name: 'wp-content',
       EFSVolumeConfiguration: {
-          FilesystemId: fileSystem.fileSystemId,
-          TransitEncryption: 'ENABLED'
+        FilesystemId: fileSystem.fileSystemId,
+        TransitEncryption: 'ENABLED'
       },
     }]);
 
     // add the container to the task definition
     const container = taskDef.addContainer('Wordpress', {
-      image: ecs.ContainerImage.fromRegistry('wordpress:6.4.2-apache'),
+      image: ecs.ContainerImage.fromRegistry('wordpress:6.4.3-php8.3-apache'),
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'Wordpress' }),
       memoryLimitMiB: 1024,
       cpu: 512,
@@ -203,11 +214,26 @@ export class AwsEcsWordpressStack extends cdk.Stack {
       readOnly: false
     });
 
+    const lbSecurityGroup = new ec2.SecurityGroup(this, 'ApplicationLoadBalancerSecurityGroup', {
+      vpc: vpc,
+      description: 'deny access from the alb',
+      allowAllOutbound: false
+    });
+
+    const lb = new alb.ApplicationLoadBalancer(this, 'alb', {
+      vpc: vpc,
+      internetFacing: true,
+      loadBalancerName: 'alb',
+    });
+    lb.addSecurityGroup(lbSecurityGroup);
+
     // create the wordpress service
     const wordpress = new ecsPatterns.ApplicationLoadBalancedFargateService(this, 'Service', {
-      cluster,
+      cluster: cluster,
       taskDefinition: taskDef,
       platformVersion: ecs.FargatePlatformVersion.VERSION1_4,
+      loadBalancer: lb,
+      openListener: false
     });
 
     wordpress.service.connections.addSecurityGroup(taskSecurityGroup);
@@ -228,8 +254,14 @@ export class AwsEcsWordpressStack extends cdk.Stack {
     });
 
     // configure security groups
-    db.connections.allowFrom(ec2.Peer.ipv4(vpc.vpcCidrBlock), ec2.Port.tcp(3306), 'allow connections from within the vpc to the database')
-    fsSecurityGroup.addIngressRule(ec2.Peer.ipv4(vpc.vpcCidrBlock), ec2.Port.tcp(2049), 'allow access to the efs file mounts')
-
+    db.connections.allowFrom(ec2.Peer.ipv4(vpc.vpcCidrBlock),
+      ec2.Port.tcp(3306), 'allow connections from within the vpc to the database');
+    fsSecurityGroup.addIngressRule(ec2.Peer.ipv4(vpc.vpcCidrBlock),
+      ec2.Port.tcp(2049), 'allow access to the efs file mounts');
+    lbSecurityGroup.connections.allowInternally(ec2.Port.tcp(80));
+    lbSecurityGroup.addEgressRule(ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(80), 'allow access to the internet');
+    lbSecurityGroup.addIngressRule(ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(80), 'allow access from the internet');
   }
 }
